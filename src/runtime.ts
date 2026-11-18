@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { createStore } from "zustand/vanilla";
 import { HubConnectionBuilder, LogLevel } from "@microsoft/signalr";
 import type { HubConnection, IHttpConnectionOptions } from "@microsoft/signalr";
+import { refreshSubscriptions, stopSubscriptions } from "./subscriptions.ts";
 
 export interface UseEntityTrackerOptions {
   backendUrl: string;
@@ -10,21 +11,35 @@ export interface UseEntityTrackerOptions {
   httpConnectionOptions?: IHttpConnectionOptions;
   configureBuilder?: (builder: HubConnectionBuilder) => HubConnectionBuilder;
   configurationKey?: string | number;
+  onError?: (error: unknown) => void;
 }
 
 interface TrackerState {
   configuration: UseEntityTrackerOptions | undefined;
   connection: HubConnection | undefined;
+  listeners: ReadonlyMap<symbol, { types: Set<string> }>;
+  subscriptionCounts: ReadonlyMap<string, number>;
 }
 
 // Internal: subscriptions and connection acquisition belong to the consumer-hook stage.
 export const trackerStore = createStore<TrackerState>(() => ({
   configuration: undefined,
   connection: undefined,
+  listeners: new Map(),
+  subscriptionCounts: new Map(),
 }));
 let owner: symbol | undefined;
 let revision = 0;
 let transition = Promise.resolve();
+let errorHandler: ((error: unknown) => void) | undefined;
+export function reportError(error: unknown) {
+  try {
+    if (errorHandler) errorHandler(error);
+    else console.error(error);
+  } catch (reportingError) {
+    console.error(reportingError);
+  }
+}
 
 export function createConnectionBuilder(options: UseEntityTrackerOptions): HubConnectionBuilder {
   const url =
@@ -44,19 +59,25 @@ export function createConnectionBuilder(options: UseEntityTrackerOptions): HubCo
 
 function replaceConfiguration(options: UseEntityTrackerOptions | undefined) {
   const current = ++revision;
-  const old = trackerStore.getState().connection;
+  const stopped = stopSubscriptions();
   trackerStore.setState({ configuration: undefined, connection: undefined });
   transition = transition.then(async () => {
-    if (old) await old.stop().catch((error: unknown) => console.error(error));
-    if (current === revision) trackerStore.setState({ configuration: options });
+    await stopped;
+    if (current === revision) {
+      trackerStore.setState({ configuration: options });
+      refreshSubscriptions();
+    }
   });
 }
 
 /** Install shared configuration; change configurationKey to apply new options. */
 export function useEntityTracker(options: UseEntityTrackerOptions): void {
   const latest = useRef(options);
-  latest.current = options;
   const identity = useRef(Symbol("EntityTracker owner"));
+  useEffect(() => {
+    latest.current = options;
+    if (!owner || owner === identity.current) errorHandler = options.onError;
+  });
   useEffect(() => {
     if (owner && owner !== identity.current)
       throw new Error("Only one useEntityTracker configuration owner may be mounted.");
@@ -74,6 +95,7 @@ export function useEntityTracker(options: UseEntityTrackerOptions): void {
       if (owner === identity.current) {
         owner = undefined;
         replaceConfiguration(undefined);
+        errorHandler = undefined;
       }
     };
   }, [options.backendUrl, options.configurationKey]);

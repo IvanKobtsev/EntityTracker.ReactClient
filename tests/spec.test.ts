@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
-import { renderContracts, validateSpec } from "../src/generation/spec.ts";
+import { renderContracts, renderHook, validateSpec } from "../src/generation/spec.ts";
 import ts from "typescript";
 
 const fixture = {
@@ -23,6 +23,54 @@ const fixture = {
   eventMetadata: { type: "Metadata", nullable: true },
 };
 describe("specification", () => {
+  it("generates an inferred consumer API for single types and readonly tuples", () => {
+    validateSpec(fixture);
+    const source =
+      renderContracts(fixture) +
+      renderHook()
+        .replace(
+          'import { useEntityChangesRuntime } from "@entity-tracker/react-client";',
+          "declare function useEntityChangesRuntime(...args: any[]): void;",
+        )
+        .replace(
+          'import type { EntityType, EntityChange, EntityChangeEvent } from "./contracts";',
+          "",
+        ) +
+      `
+useEntityChanges(EntityType.Note, event => {
+  const value: string | null | undefined = event.changes[0]?.payload?.["odd-key"];
+  const user: string | undefined = event.metadata?.userId;
+}, { extraConditions: { Note: change => change.payload?.children.length !== 0 } });
+useEntityChanges([EntityType.Note, EntityType.Empty], event => {
+  if (event.entityType === EntityType.Empty) { const empty: null | undefined = event.changes[0]?.payload; }
+  else { const children: NotePayload[] | undefined = event.changes[0]?.payload?.children; }
+});
+useEntityChanges([EntityType.Note, EntityType.Empty] as const, () => {});
+// @ts-expect-error invalid entity name
+useEntityChanges("Missing", () => {});
+useEntityChanges(EntityType.Empty, event => {
+  // @ts-expect-error no Note payload on Empty
+  event.changes[0]?.payload?.children;
+});
+useEntityChanges(EntityType.Note, () => {}, { extraConditions: {
+  // @ts-expect-error predicate for an unselected type
+  Empty: () => true,
+} });
+`;
+    const fileName = "/typed-hook.ts";
+    const options = { strict: true, noEmit: true, target: ts.ScriptTarget.ESNext, types: [] };
+    const host = ts.createCompilerHost(options);
+    const original = host.getSourceFile.bind(host);
+    host.getSourceFile = (name, version, onError, fresh) =>
+      name === fileName
+        ? ts.createSourceFile(name, source, version, true)
+        : original(name, version, onError, fresh);
+    expect(
+      ts
+        .getPreEmitDiagnostics(ts.createProgram([fileName], options, host))
+        .map((d) => ts.flattenDiagnosticMessageText(d.messageText, "\n")),
+    ).toEqual([]);
+  });
   it("preserves expressions, names and metadata deterministically", () => {
     validateSpec(fixture);
     const source = renderContracts(fixture);
